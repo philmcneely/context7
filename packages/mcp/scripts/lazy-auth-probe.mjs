@@ -36,17 +36,22 @@ async function rpc(method, params, { ua, sessionId }) {
   const raw = await res.text();
   // Tool calls come back as SSE so headers flush before the tool finishes.
   const payload = raw.startsWith("event:") || raw.startsWith("data:") ? sseData(raw) : raw;
-  let body;
+  let body = null;
+  let unparsed = null;
   try {
     body = JSON.parse(payload);
   } catch {
-    body = payload;
+    // Something answered that isn't our server — a tunnel interstitial, a proxy
+    // error page. Keep it so the caller can say so instead of reporting an
+    // empty result, which reads like the server returned nothing.
+    unparsed = payload;
   }
   return {
     status: res.status,
     wwwAuthenticate: res.headers.get("www-authenticate"),
     sessionId: res.headers.get("mcp-session-id"),
     body,
+    unparsed,
   };
 }
 
@@ -87,11 +92,20 @@ async function probe({ label, ua }) {
     return false;
   }
   const sessionId = init.sessionId;
-  console.log(`    initialize: 200 anonymously (session ${sessionId ?? "none"})`);
+  console.log(`    initialize: ${init.status} anonymously (session ${sessionId ?? "none"})`);
 
   const list = await rpc("tools/list", {}, { ua, sessionId });
+  if (list.unparsed !== null) {
+    console.log(`    tools/list: ${list.status}, but the body is not JSON — something in front of`);
+    console.log(`      the server answered instead: ${list.unparsed.slice(0, 120)}…`);
+    return false;
+  }
+  if (list.body?.error) {
+    console.log(`    tools/list: ${list.status} ${JSON.stringify(list.body.error)}`);
+    return false;
+  }
   const tools = list.body?.result?.tools ?? [];
-  console.log(`    tools/list: 200 anonymously, ${tools.length} tool(s)`);
+  console.log(`    tools/list: ${list.status} anonymously, ${tools.length} tool(s)`);
   for (const tool of tools) {
     const schemes = (tool.securitySchemes ?? [])
       .map((s) => (s.type === "oauth2" ? `oauth2(${s.scopes?.join(" ")})` : s.type))
@@ -129,11 +143,16 @@ async function checkDiscovery() {
   console.log("\n=== OAuth discovery documents");
   for (const path of paths) {
     const res = await fetch(origin + path);
-    const doc = res.ok ? await res.json() : null;
-    const servers = doc
-      ? ` -> authorization_servers=${JSON.stringify(doc.authorization_servers)}`
-      : "";
-    console.log(`    ${path}: ${res.status}${servers}`);
+    let detail = "";
+    if (res.ok) {
+      try {
+        const doc = await res.json();
+        detail = ` -> authorization_servers=${JSON.stringify(doc.authorization_servers)}, resource=${doc.resource}`;
+      } catch {
+        detail = " -> not JSON (a proxy or tunnel answered, not the server)";
+      }
+    }
+    console.log(`    ${path}: ${res.status}${detail}`);
   }
 }
 
